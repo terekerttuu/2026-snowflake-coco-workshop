@@ -1,0 +1,159 @@
+name: SV_AP_ANALYTICS
+description: >-
+  Accounts payable (AP) invoice analytics across four ERPs: SAP, Oracle, Baan IV (EMEA) and Workday (Americas + London).
+  Grain: one row per source invoice (de-duplicated, current state). Amounts are in the original transaction currency
+  (USD, EUR, GBP) with no FX conversion, so amounts must always be grouped by CURRENCY_CODE. There is no payment status;
+  every invoice in this model is treated as open (unpaid).
+tables:
+  - name: AP_INVOICES
+    description: >-
+      Curated Silver AP invoices. One row per (SOURCE_SYSTEM, SOURCE_INVOICE_ID). INVOICE_NUMBER is the business-facing
+      invoice number and is unique within a source system.
+    base_table:
+      database: COCO_WORKSHOP
+      schema: PIPELINE_LAB
+      table: SILVER_AP_INVOICES
+    primary_key:
+      columns: [SOURCE_SYSTEM, SOURCE_INVOICE_ID]
+    dimensions:
+      - name: SOURCE_SYSTEM
+        synonyms: [ERP, source, system, source ERP]
+        description: Originating ERP system. Values SAP, ORACLE, BAAN, WORKDAY.
+        expr: SOURCE_SYSTEM
+        data_type: VARCHAR
+        is_enum: true
+        sample_values: [SAP, ORACLE, BAAN, WORKDAY]
+      - name: REGION
+        synonyms: [geography, territory]
+        description: Business region derived from the source ERP. Baan = EMEA, Workday = Americas (includes the London tenant, which cannot be separated). SAP and Oracle are global/unassigned.
+        expr: "CASE SOURCE_SYSTEM WHEN 'BAAN' THEN 'EMEA' WHEN 'WORKDAY' THEN 'AMERICAS' ELSE 'GLOBAL' END"
+        data_type: VARCHAR
+        is_enum: true
+        sample_values: [EMEA, AMERICAS, GLOBAL]
+      - name: SOURCE_INVOICE_ID
+        description: Internal invoice key in the source ERP. Use INVOICE_NUMBER for business lookups.
+        expr: SOURCE_INVOICE_ID
+        data_type: VARCHAR
+      - name: INVOICE_NUMBER
+        synonyms: [invoice no, invoice reference, invoice ref]
+        description: Business-facing invoice number, unique within a source system. Count distinct invoices on this together with SOURCE_SYSTEM.
+        expr: INVOICE_NUMBER
+        data_type: VARCHAR
+      - name: VENDOR_ID
+        synonyms: [supplier id, vendor code, supplier code]
+        description: Vendor identifier as issued by the source ERP. IDs are source-specific (e.g. BV- = Baan, WS- = Workday); the same real-world vendor may have different IDs in different ERPs. There is no cross-ERP vendor master.
+        expr: VENDOR_ID
+        data_type: VARCHAR
+      - name: VENDOR_NAME
+        synonyms: [vendor, supplier, supplier name, payee]
+        description: Vendor display name from the source ERP. Use this to group 'by vendor' across ERPs; may contain accented characters.
+        expr: VENDOR_NAME
+        data_type: VARCHAR
+      - name: CURRENCY_CODE
+        synonyms: [currency]
+        description: ISO currency of INVOICE_AMOUNT. Always group amount metrics by this column; never add amounts across currencies.
+        expr: CURRENCY_CODE
+        data_type: VARCHAR
+        is_enum: true
+        sample_values: [USD, EUR, GBP]
+      - name: BUSINESS_UNIT
+        synonyms: [cost center, cost centre, department, BU]
+        description: Business unit, represented by the source ERP cost center code. Codes are source-specific (e.g. BC-MFG in Baan, WCC-HR in Workday) and are not comparable across ERPs; group together with SOURCE_SYSTEM.
+        expr: COST_CENTER
+        data_type: VARCHAR
+      - name: GL_ACCOUNT
+        synonyms: [general ledger account, ledger account, account code]
+        description: Source-native general ledger account code. Not a unified chart of accounts; not comparable across ERPs.
+        expr: GL_ACCOUNT
+        data_type: VARCHAR
+      - name: PAYMENT_TERMS
+        synonyms: [terms]
+        description: Payment terms as sent by the source. Formats differ by ERP (NET30, N30, Net 30 all mean 30 days). Use PAYMENT_TERMS_DAYS for comparisons.
+        expr: PAYMENT_TERMS
+        data_type: VARCHAR
+      - name: PAYMENT_TERMS_DAYS
+        synonyms: [terms days, net days]
+        description: Payment terms normalized to number of days (30, 60), parsed from PAYMENT_TERMS.
+        expr: "TRY_TO_NUMBER(REGEXP_SUBSTR(PAYMENT_TERMS, '[0-9]+'))"
+        data_type: NUMBER
+      - name: APPROVAL_STATUS
+        synonyms: [status, approval state]
+        description: Normalized approval status. APPROVED or PENDING. 'Awaiting approval', 'in review' and 'open approval' mean PENDING. This is not a payment status.
+        expr: APPROVAL_STATUS
+        data_type: VARCHAR
+        is_enum: true
+        sample_values: [APPROVED, PENDING]
+      - name: PO_NUMBER
+        synonyms: [purchase order, PO]
+        description: Purchase order number. NULL means a non-PO (typically service) invoice.
+        expr: PO_NUMBER
+        data_type: VARCHAR
+      - name: LINE_DESCRIPTION
+        synonyms: [memo, description]
+        description: Free-text invoice description; may be in Dutch for Baan invoices.
+        expr: LINE_DESCRIPTION
+        data_type: VARCHAR
+    time_dimensions:
+      - name: INVOICE_DATE
+        synonyms: [invoice date, bill date, spend date]
+        description: Date the invoice was issued. Default date for spend, counts, trends and 'last N months' questions.
+        expr: INVOICE_DATE
+        data_type: DATE
+      - name: INVOICE_MONTH
+        synonyms: [month, invoice month]
+        description: First day of the invoice month (DATE_TRUNC of INVOICE_DATE). Use for 'by month' questions.
+        expr: "DATE_TRUNC('MONTH', INVOICE_DATE)"
+        data_type: DATE
+      - name: DUE_DATE
+        synonyms: [payment due date, due]
+        description: Date payment is due. Use for overdue and aging questions; overdue means DUE_DATE before the as-of date.
+        expr: DUE_DATE
+        data_type: DATE
+      - name: CREATED_AT
+        description: UTC timestamp the invoice record was created in the source ERP. Technical; prefer INVOICE_DATE for business questions.
+        expr: CREATED_AT
+        data_type: TIMESTAMP_NTZ
+    facts:
+      - name: INVOICE_AMOUNT
+        synonyms: [amount, invoice value, AP amount]
+        description: Invoice amount in CURRENCY_CODE (original currency, no FX).
+        expr: INVOICE_AMOUNT
+        data_type: NUMBER
+    metrics:
+      - name: TOTAL_AP_SPEND
+        synonyms: [AP spend, total spend, total invoiced, invoice total]
+        description: Sum of invoice amounts. Always group by CURRENCY_CODE.
+        expr: SUM(INVOICE_AMOUNT)
+      - name: INVOICE_COUNT
+        synonyms: [number of invoices, invoice volume, count of invoices]
+        description: Number of invoices (rows; one row per source invoice).
+        expr: COUNT(*)
+      - name: VENDOR_COUNT
+        synonyms: [number of vendors, supplier count]
+        description: Distinct vendors by source-specific VENDOR_ID.
+        expr: COUNT(DISTINCT VENDOR_ID)
+      - name: AVERAGE_INVOICE_AMOUNT
+        synonyms: [avg invoice, average invoice value]
+        description: Average invoice amount. Always group by CURRENCY_CODE.
+        expr: AVG(INVOICE_AMOUNT)
+      - name: UNPAID_INVOICE_AMOUNT
+        synonyms: [unpaid amount, open amount, outstanding amount, AP balance, amount owed]
+        description: Amount of invoices not yet paid. The model has no payment data, so every current invoice is treated as unpaid; equals TOTAL_AP_SPEND. Always group by CURRENCY_CODE.
+        expr: SUM(INVOICE_AMOUNT)
+      - name: PENDING_APPROVAL_AMOUNT
+        synonyms: [pending amount, amount awaiting approval]
+        description: Amount of invoices with APPROVAL_STATUS = PENDING. Always group by CURRENCY_CODE.
+        expr: "SUM(CASE WHEN APPROVAL_STATUS = 'PENDING' THEN INVOICE_AMOUNT ELSE 0 END)"
+      - name: PENDING_INVOICE_COUNT
+        synonyms: [invoices awaiting approval]
+        description: Number of invoices with APPROVAL_STATUS = PENDING.
+        expr: "COUNT_IF(APPROVAL_STATUS = 'PENDING')"
+    filters:
+      - name: PENDING_APPROVAL
+        synonyms: [awaiting approval, in review]
+        description: Invoices not yet approved.
+        expr: "APPROVAL_STATUS = 'PENDING'"
+      - name: NON_PO_INVOICES
+        synonyms: [no PO, without purchase order]
+        description: Invoices without a purchase order.
+        expr: PO_NUMBER IS NULL
